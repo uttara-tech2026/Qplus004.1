@@ -34,7 +34,7 @@ from aiogram.filters import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError, TelegramForbiddenError
 
 load_dotenv()
 
@@ -265,10 +265,8 @@ def apply_caption_rules(
 
     if replace_link_target and text:
         if replace_link_from:
-            # Case-insensitive replacement of the specific target link or text
             text = re.sub(re.escape(replace_link_from), replace_link_target, text, flags=re.IGNORECASE)
         else:
-            # Universal telegram link pattern (supports https://t.me/+, t.me/joinchat, @usernames, etc.)
             tg_link_pattern = r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[a-zA-Z0-9_\-]+|[a-zA-Z0-9_\-]+)"
             text = re.sub(tg_link_pattern, replace_link_target, text)
 
@@ -624,6 +622,10 @@ class AdminStates(StatesGroup):
     waiting_for_uploader_id = State()
     waiting_for_uploader_name = State()
     
+    # Vault / Forward Settings
+    waiting_for_private_vault = State()
+    waiting_for_forward_delay = State()
+
     # Ad Management states
     waiting_for_ad_post = State()
     waiting_for_ad_delay = State()
@@ -647,7 +649,6 @@ async def bot_added_as_admin(event: ChatMemberUpdated, bot: Bot):
     async with pool.acquire() as conn:
         master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
         
-        # If already the Master Log, do not add to broadcast destinations table
         if master_dest and master_dest == chat_id:
             await dispatch_notification(bot, f"ℹ️ Bot refreshed as Admin in Master Log channel: <b>{chat_title}</b>")
             return
@@ -786,7 +787,7 @@ async def get_admin_main_kb() -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📂 Manage Queues", callback_data="admin_manage_hub")],
+            [InlineKeyboardButton(text="🔄 Forward Message Settings", callback_data="admin_forward_hub")],
             [InlineKeyboardButton(text="📢 Advertisement Hub", callback_data="admin_ads_hub")],
             [InlineKeyboardButton(text="✏️ Edit Queue Captions", callback_data="admin_caption_hub")],
             [InlineKeyboardButton(text=f"📡 Available Destinations (🟢{matured_count} | ⚪{unmatured_count})", callback_data="admin_view_destinations")],
@@ -865,22 +866,156 @@ async def cmd_addest(message: Message, command: CommandObject):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
+# ==================== FORWARD MESSAGE SETTINGS (VAULT) ====================
 
-# ==================== HUBS: MANAGE & MATRIX ====================
-
-@router.callback_query(F.data == "admin_manage_hub")
-async def admin_manage_hub(callback: CallbackQuery):
+@router.callback_query(F.data == "admin_forward_hub")
+async def admin_forward_hub(callback: CallbackQuery):
     await callback.answer()
-    if callback.from_user.id != get_admin_id():
-        return
+    if callback.from_user.id != get_admin_id(): return
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        vault_id = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'private_vault_id'")
+        delay = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'forward_delay'") or "5"
+        status = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'forward_status'") or "paused"
+        
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📂 List & Manage Queues", callback_data="admin_list_queues")],
-        [InlineKeyboardButton(text="🚀 Running Queues Hub", callback_data="admin_running_queues")],
-        [InlineKeyboardButton(text="➕ Create Queue", callback_data="admin_create_queue")],
+        [InlineKeyboardButton(text="🏦 Set Private Vault ID", callback_data="set_private_vault")],
+        [InlineKeyboardButton(text="⏱ Set Delay (Seconds)", callback_data="set_forward_delay")],
+        [InlineKeyboardButton(text=f"Toggle Status: {'🟢 ACTIVE' if status == 'active' else '🔴 PAUSED'}", callback_data="toggle_forward_status")],
         [InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")]
     ])
-    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 <b>Manage Queues Hub</b>\n\nChoose an option:", reply_markup=kb)
+    
+    text = (
+        "🔄 <b>Forward Message Settings (Private Vault)</b>\n\n"
+        f"• <b>Private Vault ID:</b> <code>{vault_id or 'Not Set'}</code>\n"
+        f"• <b>Delay Between Sends:</b> <code>{delay}s</code>\n"
+        f"• <b>Status:</b> <code>{status.upper()}</code>\n\n"
+        "When active, any message sent to the Private Vault will be automatically copied to all configured broadcast destinations."
+    )
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, text, reply_markup=kb)
 
+
+@router.callback_query(F.data == "set_private_vault")
+async def set_private_vault_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id(): return
+    await state.set_state(AdminStates.waiting_for_private_vault)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "🏦 <b>Set Private Vault ID:</b>\n\nSend the numeric Chat ID (e.g., <code>-100123456789</code>) of the vault:")
+
+
+@router.message(AdminStates.waiting_for_private_vault, F.text)
+async def save_private_vault(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id(): return
+    vault_id = message.text.strip()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('private_vault_id', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", vault_id)
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_forward_hub")]])
+    await message.answer(f"✅ Private Vault ID set to <code>{vault_id}</code>.", reply_markup=kb)
+
+
+@router.callback_query(F.data == "set_forward_delay")
+async def set_forward_delay_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id(): return
+    await state.set_state(AdminStates.waiting_for_forward_delay)
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "⏱ <b>Set Forward Delay:</b>\n\nSend the delay in seconds (e.g., <code>5</code>):")
+
+
+@router.message(AdminStates.waiting_for_forward_delay, F.text)
+async def save_forward_delay(message: Message, state: FSMContext):
+    if message.from_user.id != get_admin_id(): return
+    delay = message.text.strip()
+    if not delay.isdigit():
+        await message.answer("⚠️ Must be a numeric number.")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('forward_delay', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", delay)
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_forward_hub")]])
+    await message.answer(f"✅ Forward delay set to <code>{delay}</code> seconds.", reply_markup=kb)
+
+
+@router.callback_query(F.data == "toggle_forward_status")
+async def toggle_forward_status(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id(): return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        status = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'forward_status'")
+        new_status = "active" if status != "active" else "paused"
+        await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('forward_status', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", new_status)
+    await admin_forward_hub(callback)
+
+
+async def vault_forward_worker(bot: Bot, from_chat_id: int, message_id: int):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            delay_str = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'forward_delay'")
+            delay = int(delay_str) if delay_str and delay_str.isdigit() else 5
+            
+            master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
+            target_dests = await conn.fetch("SELECT chat_id FROM destinations WHERE (chat_id != $1 OR $1 IS NULL)", master_dest)
+            
+        if not target_dests:
+            return
+            
+        notified_403 = set()
+            
+        for d in target_dests:
+            cid = d["chat_id"]
+            try:
+                await bot.copy_message(chat_id=cid, from_chat_id=from_chat_id, message_id=message_id)
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
+            except TelegramForbiddenError:
+                if cid not in notified_403:
+                    notified_403.add(cid)
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🗑 Confirm Purge", callback_data=f"purge_dest:{cid}")],
+                        [InlineKeyboardButton(text="❌ Ignore", callback_data="ignore_purge")]
+                    ])
+                    await safe_send_message(
+                        bot, 
+                        ADMIN_ID, 
+                        f"⚠️ <b>403 Forbidden!</b>\nBot kicked from destination <code>{cid}</code> during Vault Forwarding.\n\nAuto-purge this dead destination to protect the bot?", 
+                        reply_markup=kb
+                    )
+            except Exception:
+                pass
+                
+            await asyncio.sleep(delay)
+    except Exception as e:
+        logger.error(f"Vault Forward Error: {e}")
+
+
+# ==================== AUTO-PURGE DEAD DESTINATIONS ====================
+
+@router.callback_query(F.data.startswith("purge_dest:"))
+async def admin_purge_dest(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id(): return
+    cid = callback.data.split(":")[1]
+    
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM destinations WHERE chat_id = $1", cid)
+        await conn.execute("DELETE FROM join_requests WHERE chat_id = $1", cid)
+        
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, f"✅ <b>Destination Purged:</b> <code>{cid}</code> has been successfully removed from the database to prevent spam flags.")
+
+@router.callback_query(F.data == "ignore_purge")
+async def admin_ignore_purge(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != get_admin_id(): return
+    await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "❌ <b>Purge Ignored.</b> Destination kept.")
+
+
+# ==================== MATRIX & HUBS ====================
 
 @router.callback_query(F.data == "admin_matrix_hub")
 async def admin_matrix_hub(callback: CallbackQuery):
@@ -987,6 +1122,7 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
     master_msg_id: Optional[int] = None
     master_dest: Optional[str] = None
     qname = f"Queue_{queue_id}"
+    notified_403 = set()
 
     try:
         pool = await get_pool()
@@ -998,7 +1134,6 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
             )
             master_dest = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'master_log_chat_id'")
 
-            # Strictly exclude Master Log Destination from all broadcasts
             if target_scope == "matured":
                 target_dests = await conn.fetch(
                     "SELECT chat_id, title FROM destinations WHERE is_unmatured = FALSE AND (chat_id != $1 OR $1 IS NULL)",
@@ -1098,6 +1233,15 @@ async def broadcast_worker(bot: Bot, queue_id: int, target_scope: str = "both"):
                     )
                     async with pool.acquire() as conn:
                         await conn.execute("UPDATE destinations SET posts_delivered = posts_delivered + 1 WHERE chat_id = $1", cid)
+                except TelegramForbiddenError:
+                    if cid not in notified_403:
+                        notified_403.add(cid)
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🗑 Confirm Purge", callback_data=f"purge_dest:{cid}")],
+                            [InlineKeyboardButton(text="❌ Ignore", callback_data="ignore_purge")]
+                        ])
+                        if admin_chat_id:
+                            await safe_send_message(bot, admin_chat_id, f"⚠️ <b>403 Forbidden!</b>\nBot kicked from destination <code>{cid}</code> during broadcast.\n\nAuto-purge?", reply_markup=kb)
                 except Exception:
                     pass
 
@@ -1167,6 +1311,7 @@ async def ad_broadcast_worker(bot: Bot, target_scope: str = "both"):
     admin_chat_id = get_admin_id()
     admin_msg_id: Optional[int] = None
     master_msg_id: Optional[int] = None
+    notified_403 = set()
 
     try:
         pool = await get_pool()
@@ -1179,7 +1324,6 @@ async def ad_broadcast_worker(bot: Bot, target_scope: str = "both"):
             min_d = int(min_d_val) if min_d_val and min_d_val.isdigit() else 5
             max_d = int(max_d_val) if max_d_val and max_d_val.isdigit() else 15
 
-            # Strictly exclude Master Log Destination
             if target_scope == "matured":
                 target_dests = await conn.fetch(
                     "SELECT chat_id, title FROM destinations WHERE is_unmatured = FALSE AND (chat_id != $1 OR $1 IS NULL)",
@@ -1223,6 +1367,15 @@ async def ad_broadcast_worker(bot: Bot, target_scope: str = "both"):
             for cid in target_chat_ids:
                 try:
                     await bot.copy_message(chat_id=cid, from_chat_id=ad["from_chat_id"], message_id=ad["message_id"])
+                except TelegramForbiddenError:
+                    if cid not in notified_403:
+                        notified_403.add(cid)
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🗑 Confirm Purge", callback_data=f"purge_dest:{cid}")],
+                            [InlineKeyboardButton(text="❌ Ignore", callback_data="ignore_purge")]
+                        ])
+                        if admin_chat_id:
+                            await safe_send_message(bot, admin_chat_id, f"⚠️ <b>403 Forbidden!</b>\nBot kicked from destination <code>{cid}</code> during Ad Broadcast.\n\nAuto-purge?", reply_markup=kb)
                 except Exception:
                     pass
 
@@ -1940,7 +2093,7 @@ async def admin_running_queues(callback: CallbackQuery):
         queues = await conn.fetch("SELECT id, name, run_count FROM queues ORDER BY id ASC")
 
     if not queues:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
         await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "🚀 <b>Running Queues Hub</b>\n\nNo queues created yet.", reply_markup=kb)
         return
 
@@ -1955,7 +2108,7 @@ async def admin_running_queues(callback: CallbackQuery):
         text_lines.append(f"• <b>{qname}</b> — {status_symbol} (Runs: {q['run_count']})")
         buttons.append([InlineKeyboardButton(text=f"⚙️ Schedule/Control: {qname} ({status_symbol})", callback_data=f"run_hub_q:{qid}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Back to Manage Hub", callback_data="admin_manage_hub")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Admin Menu", callback_data="admin_back")])
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
@@ -2247,7 +2400,6 @@ async def render_dest_actions(callback: CallbackQuery, chat_id: str):
 
     buttons = []
 
-    # Category conversion
     if is_unmatured:
         buttons.append([InlineKeyboardButton(text="🟢 Convert to Matured Channel", callback_data=f"dest_convert_matured:{chat_id}")])
         join_btn_text = "⏹ Pause Accepting Requests" if accept_requests else "▶️ Start Accepting Join Requests"
@@ -2442,16 +2594,13 @@ async def admin_dest_set_master(callback: CallbackQuery, bot: Bot):
         return
     chat_id = callback.data.split(":")[1]
 
-    # Terminate any running join tasks for this destination
     if chat_id in active_join_tasks:
         active_join_tasks[chat_id].cancel()
         del active_join_tasks[chat_id]
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Remove completely from broadcast destinations
         await conn.execute("DELETE FROM destinations WHERE chat_id = $1", chat_id)
-        # Store as Master Log in bot_settings
         await conn.execute(
             """
             INSERT INTO bot_settings (key, value)
@@ -2666,6 +2815,57 @@ async def admin_uploader_name_received(message: Message, state: FSMContext, bot:
         parse_mode="HTML",
         reply_markup=kb
     )
+
+
+# ==================== FLEZEN UPLOADER COMMANDS ====================
+
+@router.message(Command("adduploader"))
+async def cmd_add_uploader(message: Message, command: CommandObject):
+    if message.from_user.id != get_admin_id(): return
+
+    args = command.args
+    if not args:
+        await message.answer("⚠️ <b>Usage:</b>\n<code>/adduploader user_id [name]</code>\n\nExample:\n<code>/adduploader 123456789 John</code>", parse_mode="HTML")
+        return
+
+    parts = args.strip().split(maxsplit=1)
+    uid_str = parts[0]
+    name = parts[1] if len(parts) > 1 else "Flezen uploader"
+
+    if not uid_str.isdigit():
+        await message.answer("⚠️ User ID must be numeric.")
+        return
+
+    uid = int(uid_str)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO uploaders (user_id, name, queue_id)
+            VALUES ($1, $2, NULL)
+            ON CONFLICT(user_id) DO UPDATE SET name = EXCLUDED.name
+            """,
+            uid, name
+        )
+
+    await message.answer(f"✅ Uploader <b>{name}</b> (<code>{uid}</code>) added successfully.", parse_mode="HTML")
+
+
+@router.message(Command("deluploader"))
+async def cmd_del_uploader(message: Message, command: CommandObject):
+    if message.from_user.id != get_admin_id(): return
+
+    args = command.args
+    if not args or not args.strip().isdigit():
+        await message.answer("⚠️ <b>Usage:</b>\n<code>/deluploader user_id</code>", parse_mode="HTML")
+        return
+
+    uid = int(args.strip())
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM uploaders WHERE user_id = $1", uid)
+
+    await message.answer(f"✅ Uploader <code>{uid}</code> deleted.", parse_mode="HTML")
 
 
 # ==================== USER HANDLERS & ACCESS REQUESTS ====================
@@ -2966,7 +3166,7 @@ async def user_finish_uploading(message: Message, bot: Bot):
     )
 
 
-# ==================== AUTO-DETECT INCOMING POSTS ====================
+# ==================== AUTO-DETECT INCOMING POSTS & VAULT LISTENER ====================
 
 @router.message(StateFilter(None), ~F.text.startswith("/"))
 async def handle_auto_detect_posts(message: Message, bot: Bot, state: FSMContext):
@@ -2977,6 +3177,16 @@ async def handle_auto_detect_posts(message: Message, bot: Bot, state: FSMContext
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        vault_id = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'private_vault_id'")
+        fwd_status = await conn.fetchval("SELECT value FROM bot_settings WHERE key = 'forward_status'")
+
+        # 1. LIVE FORWARDER / VAULT CHECK
+        if vault_id and str(message.chat.id) == str(vault_id):
+            if fwd_status == "active":
+                asyncio.create_task(vault_forward_worker(bot, message.chat.id, message.message_id))
+            return
+
+        # 2. STANDARD FLEZEN UPLOADER BATCH CHECK
         row = await conn.fetchrow(
             """
             SELECT u.queue_id, u.name AS u_name, q.name AS q_name 
@@ -3057,7 +3267,7 @@ async def admin_list_queues(callback: CallbackQuery):
         queues = await conn.fetch("SELECT id, name FROM queues ORDER BY id ASC")
 
     if not queues:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]])
         await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 No queues found. Create one first.", reply_markup=kb)
         return
 
@@ -3065,7 +3275,7 @@ async def admin_list_queues(callback: CallbackQuery):
         [InlineKeyboardButton(text=f"📁 {row['name']}", callback_data=f"q_view:{row['id']}")]
         for row in queues
     ]
-    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_hub")])
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")])
     await safe_edit_message(callback.message.bot, callback.message.chat.id, callback.message.message_id, "📂 <b>Select a Queue to Configure:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
